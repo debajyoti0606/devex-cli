@@ -19,3 +19,4 @@ devex = "cli:main"
 
 [tool.setuptools]
 py-modules = ["cli"]
+packages = ["prompts"]

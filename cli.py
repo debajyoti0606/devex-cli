@@ -25,6 +25,18 @@ try:
 except ImportError:
     pass
 
+from prompts import (
+    SCAN_PROMPT,
+    SCAN_SYSTEM,
+    KB_SYSTEM,
+    TECH_LEAD_SYSTEM,
+    REQUIREMENTS_WRITER_SYSTEM,
+    TECH_LEAD_PLANNER_SYSTEM,
+    DEVELOPER_SYSTEM,
+    REVIEWER_SYSTEM,
+    DEVELOPER_FIX_SYSTEM,
+)
+
 from claude_agent_sdk import (
     query,
     ClaudeAgentOptions,
@@ -58,6 +70,7 @@ KB_FILE         = ".devex-kb.md"
 STATS_FILE      = ".devex-stats.json"
 GUARDRAILS_FILE = ".devex-guardrails.md"
 TASKS_DIR       = ".devex-tasks"
+BUILD_FILE      = ".devex-build.json"
 
 # Context window limit — override with CONTEXT_WINDOW env var
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "128000"))
@@ -65,31 +78,6 @@ WARN_AT        = 0.75   # warn when avg usage exceeds 75 %
 CRITICAL_AT    = 0.90   # critical at 90 %
 STATS_KEEP     = 200    # max entries to retain
 
-SCAN_PROMPT = """\
-Analyze this entire codebase and produce a comprehensive, structured knowledge \
-base in markdown that can later be injected as context to answer questions \
-about the repo without re-reading files.
-
-Cover:
-1. **Project overview** — what it does, tech stack, high-level architecture
-2. **Directory map** — every significant directory and its purpose
-3. **Core modules** — for each non-trivial file:
-   - purpose / responsibility
-   - public API: key classes, functions, CLI commands, HTTP routes
-   - notable patterns, algorithms, or gotchas
-4. **Data flow** — how data enters, transforms, and exits the system
-5. **External dependencies** — key libraries and what they're used for
-6. **Configuration & entry points** — env vars, config files, main entry points
-
-Be thorough. Do not truncate or summarise away important detail.
-"""
-
-KB_SYSTEM = """\
-You are an expert on this codebase. A knowledge base was pre-built by fully \
-scanning the repository — use it to answer questions accurately without \
-re-reading files unless the user asks for live file content or the KB lacks \
-the specific detail needed.
-"""
 
 # ── Token estimation ──────────────────────────────────────────────────────────
 
@@ -215,6 +203,7 @@ _GITIGNORE_ENTRIES = [
     ".devex-guardrails.md",
     ".devex-requirements.md",
     ".devex-devplan.md",
+    ".devex-build.json",
 ]
 
 _GITIGNORE_MARKER = "# devex — auto-generated files"
@@ -433,6 +422,182 @@ def cmd_stats(cwd: str) -> None:
         print(warn)
         print(color("  → Rebuild KB with `devex scan` to trim it, or switch to KB-agent mode.", DIM))
 
+# ── Build config ──────────────────────────────────────────────────────────────
+
+def _build_config_path(cwd: str) -> Path:
+    return Path(cwd) / BUILD_FILE
+
+def load_build_config(cwd: str) -> dict:
+    """Returns {"build": [...], "test": [...], "no_build": bool}."""
+    p = _build_config_path(cwd)
+    if not p.exists():
+        return {"build": [], "test": [], "no_build": False}
+    try:
+        data = json.loads(p.read_text())
+        # migrate old format {"commands": [...]}
+        if "commands" in data and "build" not in data:
+            data = {"build": [], "test": data["commands"], "no_build": data.get("no_build", False)}
+        return data
+    except Exception:
+        return {"build": [], "test": [], "no_build": False}
+
+def _save_build_config(cwd: str, build: list[str], test: list[str], no_build: bool) -> None:
+    _build_config_path(cwd).write_text(
+        json.dumps({"build": build, "test": test, "no_build": no_build}, indent=2)
+    )
+
+def _detect_build_commands(cwd: str) -> tuple[list[str], list[str], list[str]]:
+    """
+    Sniff common project files for build and test commands separately.
+    Returns (build_cmds, test_cmds, sources).
+    """
+    import re as _re
+    root = Path(cwd)
+    build_cmds: list[str] = []
+    test_cmds:  list[str] = []
+    sources:    list[str] = []
+
+    # package.json — npm/yarn/pnpm scripts
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text())
+            scripts = data.get("scripts", {})
+            mgr = "pnpm" if (root / "pnpm-lock.yaml").exists() else \
+                  "yarn" if (root / "yarn.lock").exists() else "npm"
+            for key in ("build", "compile", "typecheck"):
+                if key in scripts:
+                    build_cmds.append(f"{mgr} run {key}")
+            for key in ("test", "lint", "check", "validate"):
+                if key in scripts:
+                    test_cmds.append(f"{mgr} run {key}")
+            if build_cmds or test_cmds:
+                sources.append("package.json")
+        except Exception:
+            pass
+
+    # Makefile targets
+    makefile = next(
+        (root / f for f in ("Makefile", "makefile", "GNUmakefile") if (root / f).exists()),
+        None,
+    )
+    if makefile:
+        targets = _re.findall(r"^([a-zA-Z][a-zA-Z0-9_-]*)\s*:", makefile.read_text(), _re.M)
+        found = False
+        for t in targets:
+            if t.lower() in ("build", "compile"):
+                build_cmds.append(f"make {t}")
+                found = True
+            elif t.lower() in ("test", "tests", "check", "lint", "verify"):
+                test_cmds.append(f"make {t}")
+                found = True
+        if found:
+            sources.append(makefile.name)
+
+    # Python — pytest
+    has_pytest = any(
+        (root / f).exists()
+        for f in ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini")
+    )
+    if has_pytest:
+        if not any("pytest" in c for c in test_cmds):
+            test_cmds.append("pytest")
+        sources.append("pyproject.toml/setup.cfg")
+
+    # Go
+    if (root / "go.mod").exists():
+        build_cmds.append("go build ./...")
+        test_cmds.append("go test ./...")
+        sources.append("go.mod")
+
+    # Rust
+    if (root / "Cargo.toml").exists():
+        build_cmds.append("cargo build")
+        test_cmds.append("cargo test")
+        sources.append("Cargo.toml")
+
+    return build_cmds, test_cmds, sources
+
+
+async def _collect_cmds(label: str, detected: list[str]) -> list[str] | None:
+    """
+    Interactive helper: show detected commands for label, let user confirm/override.
+    Returns confirmed list, empty list (skip), or None (cancelled).
+    """
+    if detected:
+        print(color(f"\n  Detected {label} command(s):", DIM))
+        for i, cmd in enumerate(detected, 1):
+            print(color(f"    {i}. {cmd}", CYAN))
+        try:
+            answer = await anyio.to_thread.run_sync(
+                lambda: input(color(f"  Use these for {label}? [Y/n/skip] ", BOLD))
+            )
+        except (EOFError, KeyboardInterrupt):
+            return None
+        answer = answer.strip().lower()
+        if answer in ("skip", "s"):
+            return []
+        if answer in ("", "y", "yes"):
+            return detected
+        # user said no — fall through to manual entry
+        print(color(f"  Enter {label} commands (one per line, blank to finish):", DIM))
+    else:
+        print(color(f"\n  No {label} commands detected.", YELLOW))
+        print(color(f"  Enter {label} commands (one per line, blank to finish, blank immediately to skip):", DIM))
+
+    cmds: list[str] = []
+    while True:
+        try:
+            line = await anyio.to_thread.run_sync(
+                lambda: input(color(f"  {label}> ", YELLOW))
+            )
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line.strip():
+            break
+        cmds.append(line.strip())
+    return cmds
+
+
+async def _prompt_build_setup(cwd: str) -> None:
+    """
+    Called after scan. Detect build/test commands, confirm with user, save to .devex-build.json.
+    """
+    build_detected, test_detected, sources = _detect_build_commands(cwd)
+
+    print()
+    print(color("━" * 54, CYAN))
+    print(color("  devex — Build & Test Setup", BOLD + CYAN))
+    print(color("━" * 54, CYAN))
+    if sources:
+        print(color(f"  Detected from: {', '.join(sources)}", DIM))
+    print(color("  The reviewer agent will run these commands to verify your implementation.", DIM))
+
+    build_cmds = await _collect_cmds("build", build_detected)
+    if build_cmds is None:
+        return
+    test_cmds = await _collect_cmds("test", test_detected)
+    if test_cmds is None:
+        return
+
+    no_build = not build_cmds and not test_cmds
+    _save_build_config(cwd, build_cmds, test_cmds, no_build=no_build)
+
+    print()
+    if no_build:
+        print(color("  ✓ Reviewer will skip build and test.", GREEN))
+    else:
+        if build_cmds:
+            print(color(f"  ✓ Build : {', '.join(build_cmds)}", GREEN))
+        else:
+            print(color("  ✓ Build : skip", DIM))
+        if test_cmds:
+            print(color(f"  ✓ Test  : {', '.join(test_cmds)}", GREEN))
+        else:
+            print(color("  ✓ Test  : skip", DIM))
+    print(color("━" * 54, CYAN))
+
+
 # ── Scan ──────────────────────────────────────────────────────────────────────
 
 async def cmd_scan(cwd: str) -> None:
@@ -444,7 +609,7 @@ async def cmd_scan(cwd: str) -> None:
         cwd=cwd,
         tools=["Read", "Glob", "Grep"],
         permission_mode="default",
-        system_prompt="You are a code analyst. Produce exhaustive, structured documentation.",
+        system_prompt=SCAN_SYSTEM,
         max_turns=100,
     )
 
@@ -473,60 +638,12 @@ async def cmd_scan(cwd: str) -> None:
     print(color(f"\nKnowledge base saved → {dest}", GREEN + BOLD))
     print(color(f"  {size_kb:.1f} KB  ·  ~{kb_tokens:,} tokens  ·  {kb_tokens / CONTEXT_WINDOW * 100:.1f}% of context window", DIM))
 
+    await _prompt_build_setup(cwd)
+
 # ── Requirements flow ─────────────────────────────────────────────────────────
 
 REQ_FILE = ".devex-requirements.md"
 
-TECH_LEAD_SYSTEM = """\
-You are a senior tech lead whose job is to fully clarify a development task \
-before any coding begins. You have deep knowledge of the codebase via the \
-knowledge base provided.
-
-Each round you will receive the original task description and a running Q&A \
-log. Your job:
-  1. Identify what is still ambiguous or under-specified.
-  2. If clarification is needed — respond ONLY with:
-       QUESTIONS:
-       1. <first question>
-       2. <second question>
-       ...
-  3. If you have enough information to hand off to a developer — respond ONLY with:
-       READY
-
-Do not mix prose with QUESTIONS or READY. Keep questions focused and \
-non-redundant with answers already given.
-"""
-
-REQUIREMENTS_WRITER_SYSTEM = """\
-You are a senior requirements analyst and technical writer. You receive a task \
-description, a full Q&A log from a tech-lead review session, and a knowledge \
-base of the codebase. Produce a thorough requirements document in markdown.
-
-Structure:
-# <concise task title>
-
-## Overview
-What needs to be built and why (2–4 sentences).
-
-## Acceptance Criteria
-Bullet list of specific, testable outcomes.
-
-## Sub-tasks
-Numbered list. Each sub-task must have:
-  - a short title
-  - 1–3 sentences describing exactly what to implement
-  - which files / modules are likely affected (use KB knowledge)
-
-## Technical Considerations
-Patterns to follow, existing abstractions to reuse, edge cases, migrations needed.
-
-## Out of Scope
-What is explicitly NOT part of this task.
-
-## Guardrails
-If a <guardrails> block is present in the prompt, copy those rules verbatim \
-here under this heading. If no guardrails were provided, omit this section.
-"""
 
 
 async def _silent_query(
@@ -786,128 +903,6 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
 
 DEVPLAN_FILE = ".devex-devplan.md"
 
-TECH_LEAD_PLANNER_SYSTEM = """\
-You are a senior tech lead responsible for producing a precise, actionable \
-development plan that a developer can follow step-by-step with zero ambiguity.
-
-You are given:
-  1. A requirements document describing what needs to be built.
-  2. A knowledge base summarising the codebase (architecture, modules, patterns).
-  3. Direct access to the codebase via Read / Glob / Grep — use them \
-     extensively. You must READ actual code, not guess.
-
-════════════════════════════════════════════════════════
-MANDATORY PROCESS — do this before writing a single line of the plan:
-════════════════════════════════════════════════════════
-
-For EVERY file that will be changed or created:
-
-  A. READ THE SURROUNDING CODE
-     Use the Read tool to open the file and read the 30–50 lines immediately
-     around where the change will go (the insertion point or the function to
-     modify). Paste this snippet verbatim into the plan as "Nearby Code
-     Reference". Do not paraphrase — paste the real code.
-
-  B. CHECK FOR EXISTING SIMILAR FUNCTIONS
-     Before specifying "create function X", search the codebase:
-       grep -r "def similar_name" / Grep for the concept
-     Decision rules:
-       • If a function already does the same thing → specify REUSE it (give
-         the exact file:line). Do NOT create a duplicate.
-       • If a function does something close but not identical → specify EXTEND
-         it or CREATE a new one alongside it. Document your reasoning.
-       • Only if nothing similar exists → specify CREATE a new function.
-     Document this search and its result in the plan.
-
-  C. DERIVE CHANGE CONVENTION FROM THE NEARBY CODE
-     From the snippet you read, extract the exact micro-conventions in use:
-     variable naming, indentation, error handling, return types, logging,
-     imports style, docstring format, etc. Write these as a short checklist
-     the developer must match line-for-line.
-
-════════════════════════════════════════════════════════
-DEV PLAN DOCUMENT STRUCTURE:
-════════════════════════════════════════════════════════
-
-# Dev Plan: <title>
-
-## Strategy
-2–4 sentences on the overall implementation approach.
-
-## Global Codebase Conventions
-Patterns observed across the repo that apply everywhere:
-- Naming conventions (variables, functions, classes, files)
-- Error handling idiom
-- Import ordering
-- Logging/print style
-- Test file naming and structure
-
-## Implementation Steps
-
-For each sub-task from the requirements, produce a section like this:
-
----
-### Step N — <sub-task title>
-
-**Files to change / create:**
-- `path/to/file.py` — brief description of what changes
-
-**Existing Function Check:**
-- Searched for: `<search terms / grep pattern used>`
-- Result: FOUND `existing_func()` at `path/to/file.py:42` / NOT FOUND
-- Decision: [REUSE existing_func | EXTEND existing_func | CREATE new_func]
-  Reason: <one sentence why>
-
-**Nearby Code Reference:**
-The actual code surrounding the insertion point, read with the Read tool.
-Include file path and line numbers.
-
-```
-// path/to/file.py  lines N–M
-<paste verbatim code snippet here>
-```
-
-**Change Convention** (derived from the snippet above):
-- [ ] Use the same naming style as `existing_var` on line N
-- [ ] Match the error-handling pattern: `try/except X` returning `Y`
-- [ ] Follow the same import style already in the file
-- [ ] Use the same helper `util_fn()` already called nearby
-- (add as many specific bullets as apply)
-
-**Logic:**
-Precise description: function signature, parameters, return type, \
-algorithm, edge cases, how it connects to surrounding code.
-
-**Git commit message for this step:**
-`feat: <concise description>`
-
----
-
-## Implementation Order
-Numbered list with one-line rationale per ordering decision.
-
-## Testing Plan
-- What to test per step.
-- Existing test file to mirror (paste its first 20 lines as reference).
-- Fixtures or mocks needed.
-
-## Risks & Gotchas
-Migration concerns, backward-compat issues, things that could break.
-
-## Guardrails
-If guardrails were provided, list them verbatim here.
-
-════════════════════════════════════════════════════════
-QUALITY BAR:
-════════════════════════════════════════════════════════
-- Every step MUST have a "Nearby Code Reference" with a real pasted snippet.
-- Every step MUST have an "Existing Function Check" with a documented search.
-- Every "Change Convention" checklist must be derived from the actual snippet,
-  not invented. Generic advice like "follow good practices" is not allowed.
-- A developer reading only this plan — without looking at any other file —
-  must know exactly what to write, character for character.
-"""
-
 
 async def cmd_devplan(
     cwd: str,
@@ -1010,90 +1005,6 @@ Follow the MANDATORY PROCESS in your instructions:
 
 
 # ── Developer agent ───────────────────────────────────────────────────────────
-
-DEVELOPER_SYSTEM = """\
-You are a senior software developer implementing a feature from a detailed \
-dev plan produced by the tech lead.
-
-You are given:
-  1. A requirements document — what needs to be built.
-  2. A dev plan — contains step-by-step instructions, AND for each step:
-       • "Nearby Code Reference" — the actual code snippet from the file
-         surrounding your insertion point.
-       • "Change Convention" — a checklist derived from that snippet.
-       • "Existing Function Check" — whether to reuse, extend, or create.
-  3. A knowledge base summarising the codebase.
-  4. Full tool access: Read / Glob / Grep / Write / Edit / Bash.
-
-════════════════════════════════════════════════════════
-CONVENTION RULE — non-negotiable:
-════════════════════════════════════════════════════════
-The dev plan's "Nearby Code Reference" and "Change Convention" checklist for
-each step are LAW. Every piece of code you write must match them exactly:
-  - Same naming style (variables, functions, classes).
-  - Same error-handling pattern.
-  - Same import style.
-  - Same helper functions and utilities already in use nearby.
-  - Same indentation, spacing, and formatting style.
-
-IF YOU MUST DEVIATE from what the plan specifies — e.g. the plan references
-a function that doesn't exist, the signature is wrong, or there is a genuine
-technical blocker — you MUST mark it:
-
-  ##REVIEW## <reason for deviation in one sentence>
-
-Place this comment on the line immediately BEFORE the deviating code block.
-One ##REVIEW## per deviation. Do not use it for minor stylistic choices.
-
-════════════════════════════════════════════════════════
-WORKFLOW — follow in order:
-════════════════════════════════════════════════════════
-
-STEP 0 — Create branch
-  git checkout -b <branch-name>
-  Use the branch name from the task prompt. If not given, derive from the
-  task title in kebab-case (e.g. "devex/add-stripe-subscriptions").
-
-STEP 1 — Study the plan
-  Read the dev plan in full before writing any code.
-  For each step, re-read the "Nearby Code Reference" snippet so it is fresh
-  in mind when you make that change.
-  Verify that every file path and function name referenced actually exists
-  (use Read / Grep). Note discrepancies — those are ##REVIEW## candidates.
-
-STEP 2 — Implement each step in order
-  For each Implementation Step in the plan:
-    a. Use the Read tool to open the exact file and lines shown in
-       "Nearby Code Reference" — confirm the snippet is still accurate.
-    b. Check "Existing Function Check":
-         REUSE  → call the existing function, do not rewrite it.
-         EXTEND → add a parameter or subclass, do not duplicate logic.
-         CREATE → write the new function following the Change Convention.
-    c. Write the code matching every item in the "Change Convention" checklist.
-    d. If you cannot match a checklist item, add ##REVIEW## before the block.
-    e. Commit after each step:
-         git add <changed files>
-         git commit -m "<commit message from the plan>"
-
-STEP 3 — Tests
-  Follow the "Testing Plan" section. Mirror the existing test file structure
-  shown in the plan. Commit: git commit -m "test: <description>"
-
-STEP 4 — Final check
-  Run the test suite / linter if configured \
-  (check package.json / Makefile / pyproject.toml).
-  Fix failures. Do not silence them.
-
-════════════════════════════════════════════════════════
-HARD RULES:
-════════════════════════════════════════════════════════
-  - Never skip a step or a checklist item without ##REVIEW##.
-  - Never modify files not listed in the plan without ##REVIEW##.
-  - Never refactor or "improve" code outside the change scope.
-  - One commit per implementation step — small, focused.
-  - If a guardrails block is present, treat every item as an absolute
-    prohibition. Violating a guardrail requires ##REVIEW## AND a TODO.
-"""
 
 
 def _branch_name_from_doc(doc_text: str) -> str:
@@ -1234,122 +1145,6 @@ Begin with STEP 0 (create the branch) and work through every step in order.
 
 REVIEW_DIR = ".devex-reviews"
 
-REVIEWER_SYSTEM = """\
-You are a pragmatic senior code reviewer. Your job is to catch real problems, \
-not to enforce imaginary best-practices that don't exist in this codebase.
-
-You are given:
-  1. The branch name whose changes to review.
-  2. The requirements document — what was supposed to be built.
-  3. The dev plan — how it was supposed to be built, including "Nearby Code
-     Reference" snippets and "Change Convention" checklists per step.
-  4. A knowledge base of the codebase.
-  5. Full tool access — Bash for git diff and tests, Read/Grep to inspect files.
-
-════════════════════════════════════════════════════════
-REVIEW PROCESS
-════════════════════════════════════════════════════════
-
-Step 1 — Get the diff
-  git diff $(git merge-base main HEAD) HEAD
-  (fall back to origin/main or the default branch if main doesn't exist)
-
-Step 2 — Read the EXISTING codebase around every changed location
-  For each changed file, use the Read tool to read the surrounding unchanged
-  code — the 20–40 lines before and after the diff hunk. This is your ground
-  truth for what the convention actually is in this codebase.
-
-Step 3 — Run tests
-  If a test command is configured (Makefile / pyproject.toml / package.json),
-  run it. Report actual failures — do not speculate about possible failures.
-
-Step 4 — Check requirements
-  Verify each "Acceptance Criteria" item from the requirements doc is met.
-
-Step 5 — Convention check (READ THE NEARBY CODE FIRST)
-  Compare the new code against the plan's "Change Convention" checklist AND
-  against the surrounding unchanged code you read in Step 2.
-  The nearby existing code is the authoritative standard — not textbook rules.
-
-Step 6 — ##REVIEW## markers
-  Find every ##REVIEW## comment in the diff. Check whether the stated reason
-  is valid. Flag unjustified deviations as [ERROR].
-
-════════════════════════════════════════════════════════
-WHAT TO FLAG AND WHAT NOT TO FLAG
-════════════════════════════════════════════════════════
-
-FLAG as [ERROR] — things that are genuinely broken:
-  • Functional bugs: wrong logic, off-by-one, missing case the requirements demand.
-  • Test failures reported by the test runner.
-  • Missing acceptance criteria.
-  • Guardrail violations (if guardrails are provided).
-  • Unjustified ##REVIEW## deviations from the plan.
-
-FLAG as [WARNING] — only if the surrounding existing code does it differently:
-  • Naming that clashes with the pattern used in the surrounding unchanged code.
-  • Error handling that is inconsistent with how the same file handles errors
-    elsewhere (verified by reading the file, not assumed).
-  • Missing test for a case that the existing test file clearly covers for
-    similar functions.
-
-DO NOT FLAG:
-  • Additional error handling or validation that doesn't exist in the nearby
-    code — unless the requirements or guardrails explicitly forbid it. New
-    standalone files or new logic modules may have stricter handling than the
-    surrounding legacy code; this is acceptable.
-  • Theoretical improvements ("you could also…", "it would be safer if…").
-  • Style opinions not grounded in the actual surrounding code you read.
-  • Abstractions, helper functions, or patterns the existing code doesn't use —
-    unless the plan's Change Convention checklist required them.
-  • Anything the existing codebase itself does not do in similar places.
-
-The rule is: if the rest of this codebase does not do X, do not require X.
-Read the code. Judge by what is there, not what could be there.
-
-════════════════════════════════════════════════════════
-RESPONSE FORMAT — exactly one of these two, nothing else:
-════════════════════════════════════════════════════════
-
-Format A — no real issues found:
-  APPROVED
-
-  That is the entire response. No explanation, no "all requirements are met",
-  no summary. Just the single word APPROVED on its own line.
-
-Format B — real issues found:
-  ISSUES:
-  1. [ERROR] path/to/file.py:line — precise, factual description
-  2. [WARNING] path/to/file.py:line — grounded in nearby code evidence
-  ...
-  SUMMARY:
-  One paragraph: overall state and what must be fixed.
-
-CRITICAL: if you have no [ERROR] or [WARNING] items to report, you MUST
-respond with Format A (APPROVED). Do not write prose, do not write
-"ISSUES: None found", do not explain that everything is fine. Just: APPROVED
-"""
-
-DEVELOPER_FIX_SYSTEM = """\
-You are a senior software developer fixing issues identified by a code reviewer.
-
-You are given:
-  1. The reviewer's issue log listing every problem to fix.
-  2. The original dev plan for context on intended behaviour.
-  3. A knowledge base of the codebase.
-  4. Full tool access to read and modify files and run git commands.
-
-Fix every issue listed — no skipping. For each fix:
-  a. Read the affected file before modifying it.
-  b. Make the minimal targeted change that resolves the issue.
-  c. Do not refactor unrelated code.
-  d. After fixing all issues in a logical group, commit:
-       git add <files>
-       git commit -m "fix: <brief description>"
-
-After all fixes are committed, respond with a short summary of what you changed.
-"""
-
 
 def _review_log_path(cwd: str, iteration: int) -> Path:
     d = Path(cwd) / REVIEW_DIR
@@ -1467,11 +1262,40 @@ async def _run_reviewer(
 
     system_prompt = REVIEWER_SYSTEM + kb_ctx + gr_ctx
 
+    build_cfg   = load_build_config(cwd)
+    build_cmds  = build_cfg.get("build", [])
+    test_cmds   = build_cfg.get("test", [])
+    no_build    = build_cfg.get("no_build", False)
+
+    if no_build:
+        build_instructions = (
+            "Step 3a (Build): SKIP — no build configured.\n"
+            "Step 3b (Test):  SKIP — no test configured.\n\n"
+        )
+    else:
+        build_part = (
+            "Step 3a (Build): Run EXACTLY these commands in order, wait for each to finish,\n"
+            "  capture stdout+stderr, check the exit code.\n"
+            "  If exit code != 0 — flag every error line as [ERROR].\n"
+            + "".join(f"  $ {c}\n" for c in build_cmds)
+        ) if build_cmds else "Step 3a (Build): SKIP — no build command configured.\n"
+
+        test_part = (
+            "Step 3b (Test):  Run EXACTLY these commands in order, wait for each to finish,\n"
+            "  capture stdout+stderr, check the exit code.\n"
+            "  Report only actual test failures — do not speculate.\n"
+            "  If exit code != 0 — flag each failing test as [ERROR].\n"
+            + "".join(f"  $ {c}\n" for c in test_cmds)
+        ) if test_cmds else "Step 3b (Test):  SKIP — no test command configured.\n"
+
+        build_instructions = build_part + test_part + "\n"
+
     task_prompt = (
         f"Branch to review: {branch}\n\n"
         + (f"<requirements>\n{req_doc}\n</requirements>\n\n" if req_doc else "")
         + (f"<dev_plan>\n{devplan_doc}\n</dev_plan>\n\n"     if devplan_doc else "")
         + (f"<guardrails>\n{guardrails}\n</guardrails>\n\n"  if guardrails else "")
+        + build_instructions
         + "Begin your review now. Pay attention to guardrails if provided — flag any violations."
     )
 
