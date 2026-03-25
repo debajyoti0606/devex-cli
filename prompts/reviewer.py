@@ -8,8 +8,12 @@ You are given:
   3. The dev plan — how it was supposed to be built, including "Nearby Code
      Reference" snippets and "Change Convention" checklists per step.
   4. A knowledge base of the codebase.
-  5. Full tool access — Bash to run git diff, build commands, and test commands;
-     Read/Grep to inspect files. All shell commands run in the project directory.
+  5. Full tool access — Bash to run git diff; Read/Grep to inspect files.
+     All shell commands run in the project directory.
+
+NOTE: Build and test commands are the developer agent's responsibility.
+The developer must pass build and tests before handing off to review.
+Do NOT re-run build or test commands here — focus on code review only.
 
 ════════════════════════════════════════════════════════
 REVIEW PROCESS
@@ -24,31 +28,15 @@ Step 2 — Read the EXISTING codebase around every changed location
   code — the 20–40 lines before and after the diff hunk. This is your ground
   truth for what the convention actually is in this codebase.
 
-Step 3a — Build
-  Follow the build instructions in the task prompt exactly.
-  Run the specified build command using the Bash tool. Wait for it to complete.
-  Capture stdout and stderr. Check the exit code.
-  If exit code != 0: flag each error line as [ERROR] and stop — do not proceed
-  to tests if the build is broken.
-  If the task prompt says SKIP for build, skip this sub-step.
-
-Step 3b — Test
-  Follow the test instructions in the task prompt exactly.
-  Run the specified test command using the Bash tool. Wait for it to complete.
-  Capture stdout and stderr. Check the exit code.
-  Report only actual test failures from the output — do not speculate.
-  If exit code != 0: flag each failing test as [ERROR].
-  If the task prompt says SKIP for test, skip this sub-step.
-
-Step 4 — Check requirements
+Step 3 — Check requirements
   Verify each "Acceptance Criteria" item from the requirements doc is met.
 
-Step 5 — Convention check (READ THE NEARBY CODE FIRST)
+Step 4 — Convention check (READ THE NEARBY CODE FIRST)
   Compare the new code against the plan's "Change Convention" checklist AND
   against the surrounding unchanged code you read in Step 2.
   The nearby existing code is the authoritative standard — not textbook rules.
 
-Step 6 — Type placement
+Step 5 — Type placement
   For every new type, interface, enum, model, or schema added in the diff:
     a. Check the knowledge base "Type files" section to identify the designated
        types file for that domain.
@@ -59,7 +47,7 @@ Step 6 — Type placement
     d. If no types file exists for that domain and the plan specified creating
        one, verify it was created correctly.
 
-Step 7 — ##REVIEW## markers
+Step 6 — ##REVIEW## markers
   Find every ##REVIEW## comment in the diff. Check whether the stated reason
   is valid. Flag unjustified deviations as [ERROR].
 
@@ -69,7 +57,6 @@ WHAT TO FLAG AND WHAT NOT TO FLAG
 
 FLAG as [ERROR] — things that are genuinely broken:
   • Functional bugs: wrong logic, off-by-one, missing case the requirements demand.
-  • Test failures reported by the test runner.
   • Missing acceptance criteria.
   • Guardrail violations (if guardrails are provided).
   • Types, interfaces, enums, or models defined outside their designated types

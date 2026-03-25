@@ -66,7 +66,7 @@ STEP 3 — Tests
   Follow the "Testing Plan" section. Mirror the existing test file structure
   shown in the plan. Commit: git commit -m "test: <description>"
 
-STEP 4 — Final check
+STEP 4 — Final check  ← YOUR WORK IS NOT DONE UNTIL BUILD AND TESTS PASS
   Before running any build or test command, print a visible announcement line:
     ▶ Running: <exact command>
   Then run the command via Bash. When it finishes, print:
@@ -74,9 +74,14 @@ STEP 4 — Final check
     ✗ Failed: <command>   (on non-zero exit code, then show the error output)
   Fix any failures. Do not silence them.
 
+  The build and all tests MUST be green before you consider the task complete.
+  A passing build is a hard requirement — do not hand off to review with a
+  broken build or failing tests.
+
 ════════════════════════════════════════════════════════
 HARD RULES:
 ════════════════════════════════════════════════════════
+  - Build and all tests MUST pass. Never mark work done with a red build.
   - Never skip a step or a checklist item without ##REVIEW##.
   - Never modify files not listed in the plan without ##REVIEW##.
   - Never refactor or "improve" code outside the change scope.

@@ -521,31 +521,67 @@ def _detect_build_commands(cwd: str) -> tuple[list[str], list[str], list[str]]:
 
 async def _collect_cmds(label: str, detected: list[str]) -> list[str] | None:
     """
-    Interactive helper: show detected commands for label, let user confirm/override.
-    Returns confirmed list, empty list (skip), or None (cancelled).
+    Interactive helper: show detected commands for label, let user select/override.
+    Returns confirmed list, empty list (none/skip), or None (cancelled).
+
+    When multiple options are detected the user can:
+      • Enter numbers separated by commas/spaces  e.g. "1 3"
+      • "all"  — use every detected command
+      • "none" — use no detected command (add custom ones below)
+      • "skip" — skip this category entirely
     """
     if detected:
         print(color(f"\n  Detected {label} command(s):", DIM))
         for i, cmd in enumerate(detected, 1):
             print(color(f"    {i}. {cmd}", CYAN))
+
+        if len(detected) == 1:
+            hint = "[Y/n/skip]"
+        else:
+            hint = f"[all / 1..{len(detected)} / none / skip]"
+
         try:
             answer = await anyio.to_thread.run_sync(
-                lambda: input(color(f"  Use these for {label}? [Y/n/skip] ", BOLD))
+                lambda: input(color(f"  Select {label} commands {hint}: ", BOLD))
             )
         except (EOFError, KeyboardInterrupt):
             return None
+
         answer = answer.strip().lower()
+
         if answer in ("skip", "s"):
             return []
-        if answer in ("", "y", "yes"):
-            return detected
-        # user said no — fall through to manual entry
+
+        if answer in ("none", "n", "no"):
+            # fall through to manual entry
+            selected: list[str] = []
+        elif answer in ("", "y", "yes", "all", "a"):
+            selected = list(detected)
+        else:
+            # parse comma/space-separated numbers
+            tokens = answer.replace(",", " ").split()
+            chosen: list[str] = []
+            bad: list[str] = []
+            for tok in tokens:
+                if tok.isdigit() and 1 <= int(tok) <= len(detected):
+                    chosen.append(detected[int(tok) - 1])
+                else:
+                    bad.append(tok)
+            if bad:
+                print(color(f"  Ignored unrecognised tokens: {', '.join(bad)}", YELLOW))
+            selected = chosen
+
+        if selected:
+            return selected
+
+        # no detected commands selected — offer custom entry
         print(color(f"  Enter {label} commands (one per line, blank to finish):", DIM))
     else:
         print(color(f"\n  No {label} commands detected.", YELLOW))
         print(color(f"  Enter {label} commands (one per line, blank to finish, blank immediately to skip):", DIM))
+        selected = []
 
-    cmds: list[str] = []
+    cmds: list[str] = list(selected)
     while True:
         try:
             line = await anyio.to_thread.run_sync(
@@ -1672,25 +1708,50 @@ async def cmd_execute(cwd: str, kb_content: str | None) -> None:
             continue
 
         # ── Save result summary ───────────────────────────────────────────
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        result_lines = [
+            f"# Result — Task {task_id}",
+            "",
+            f"**Title:** {title}",
+            f"**Base branch:** {base_branch}",
+            f"**Feature branch:** {branch or 'unknown'}",
+            f"**Completed:** {completed_at}",
+            "",
+            f"Implementation complete. See branch `{branch or 'unknown'}` for changes.",
+        ]
+
+        # Attach the last reviewer verdict if it exists
+        if reviews_dir.exists():
+            review_files = sorted(reviews_dir.glob("review-*.md"))
+            if review_files:
+                last_review = review_files[-1].read_text().strip()
+                result_lines += ["", "---", "## Reviewer verdict", "", last_review]
+
+        result_text = "\n".join(result_lines) + "\n"
         result_path = tdir / "result.md"
-        result_path.write_text(
-            f"# Result — Task {task_id}\n\n"
-            f"**Title:** {title}\n"
-            f"**Base branch:** {base_branch}\n"
-            f"**Feature branch:** {branch or 'unknown'}\n"
-            f"**Completed:** {datetime.now().isoformat()}\n\n"
-            f"Implementation complete. See branch `{branch or 'unknown'}` for changes.\n"
-        )
+        result_path.write_text(result_text)
 
         _save_task(cwd, task_id, {
             **task_meta,
             "status": "done",
             "branch": branch,
             "base_branch": base_branch,
+            "completed_at": completed_at,
+            "result_file": str(result_path),
         })
 
+        # ── Print result to terminal ──────────────────────────────────────
         print()
-        print(color(f"  ✓ Task {task_id} done — branch: {branch}", GREEN + BOLD))
+        print(color("  " + "─" * 50, DIM))
+        print(color(f"  ✓ Task {task_id} complete", GREEN + BOLD))
+        print(color(f"    Title:    {title}", DIM))
+        print(color(f"    Branch:   {branch or 'unknown'}", DIM))
+        print(color(f"    Result:   {result_path}", DIM))
+        print(color("  " + "─" * 50, DIM))
+        print()
+        # Print the result file contents so it's visible inline
+        for line in result_text.splitlines():
+            print(color(f"    {line}", DIM) if not line.startswith("#") else color(f"  {line}", BOLD))
 
     # Return to base branch when all tasks are done
     _git_checkout(cwd, base_branch)
@@ -1875,12 +1936,44 @@ SUBCOMMANDS = {
     "execute":      "--execute",
 }
 
+def _check_env() -> None:
+    """Verify required environment variables are set. Exit with a clear message if not."""
+    required = {
+        "ANTHROPIC_API_KEY": "Your Anthropic (or proxy) API key",
+    }
+    missing = {k: v for k, v in required.items() if not os.environ.get(k, "").strip()}
+    if not missing:
+        return
+
+    print()
+    print(color("  devex: missing required environment variable(s)", RED + BOLD))
+    print()
+    for var, desc in missing.items():
+        print(color(f"  ✗ {var}", RED + BOLD))
+        print(color(f"    {desc}", DIM))
+    print()
+    print(color("  Set the variable(s) in your .env file:", DIM))
+    print()
+    for var in missing:
+        print(color(f"    echo '{var}=your-value' >> .env", CYAN))
+    print()
+    print(color("  Or export them in your shell:", DIM))
+    print()
+    for var in missing:
+        print(color(f"    export {var}=your-value", CYAN))
+    print()
+    sys.exit(1)
+
+
 def main() -> None:
     # Allow bare subcommands: `devex scan` → `devex --scan`
     if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
         sys.argv[1] = SUBCOMMANDS[sys.argv[1]]
 
     args = build_parser().parse_args()
+
+    # Fail fast if required env vars are missing
+    _check_env()
 
     # Ensure devex runtime files are ignored by git in the target repo
     _ensure_gitignore(args.cwd)
