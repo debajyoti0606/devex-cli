@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(claude-api)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(claude-cli --help)",
+      "Bash(devex --help)",
+      "Bash(devex scan:*)"
+    ]
+  }
+}
