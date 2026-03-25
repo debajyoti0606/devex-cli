@@ -16,8 +16,8 @@ bash setup.sh
 
 The script will:
 1. Check Python ≥ 3.10
-2. Install [pipx](https://pipx.pypa.io) if not present
-3. Install `devex` globally via pipx (available in every terminal, no activation needed)
+2. Run `pip install --user -e .` to install `devex` into your user Python
+3. Check that `devex` is on your PATH, and offer to add it to `~/.zshrc` / `~/.bashrc` automatically
 4. Create `.env` from `.env.example` and prompt for your API key
 
 ### Environment variables
@@ -31,7 +31,7 @@ The script will:
 ### Updating after pulling new changes
 
 ```bash
-pipx reinstall claude-cli
+cd devex-cli && pip install --user -e .
 ```
 
 ---

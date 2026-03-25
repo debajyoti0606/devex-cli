@@ -10,11 +10,15 @@ success() { echo -e "${GREEN}${BOLD}✓${RESET} $*"; }
 warn()    { echo -e "${YELLOW}${BOLD}!${RESET} $*"; }
 die()     { echo -e "${RED}${BOLD}✗${RESET} $*" >&2; exit 1; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo -e "\n${BOLD}devex — one-time setup${RESET}\n"
 
 # ── 1. Python ≥ 3.10 ─────────────────────────────────────────────────────────
 info "Checking Python version..."
-PYTHON=$(command -v python3 || command -v python || die "Python not found. Install Python 3.10+.")
+PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null \
+  || die "Python not found. Install Python 3.10+ from https://python.org")
+
 PY_VER=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
 PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
@@ -23,37 +27,49 @@ if [[ "$PY_MAJOR" -lt 3 || ( "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ) ]]; then
 fi
 success "Python $PY_VER"
 
-# ── 2. pipx ───────────────────────────────────────────────────────────────────
-# pipx installs CLI tools in isolated venvs but exposes them globally on PATH.
-# This means `devex` works from any terminal without activating anything.
-info "Checking for pipx..."
-if ! command -v pipx &>/dev/null; then
-  warn "pipx not found — installing it now..."
-  if command -v brew &>/dev/null; then
-    brew install pipx
-  else
-    "$PYTHON" -m pip install --user pipx
-    "$PYTHON" -m pipx ensurepath
-    # reload PATH so pipx is usable immediately in this script
-    export PATH="$HOME/.local/bin:$PATH"
+# ── 2. Install devex into user Python ────────────────────────────────────────
+# --user installs into ~/.local/  (Linux) or ~/Library/Python/X.Y/  (macOS)
+# --editable means changes to source are picked up without reinstalling
+info "Installing devex (pip install --user -e .) ..."
+"$PYTHON" -m pip install --user -q -e "$SCRIPT_DIR"
+success "devex installed"
+
+# ── 3. Ensure the user bin directory is on PATH ───────────────────────────────
+USER_BIN=$("$PYTHON" -m site --user-base)/bin
+
+if ! command -v devex &>/dev/null; then
+  warn "devex is not on your PATH yet."
+  echo -e "  Add this line to your shell profile (~/.zshrc, ~/.bashrc, etc.):"
+  echo ""
+  echo -e "    ${CYAN}export PATH=\"${USER_BIN}:\$PATH\"${RESET}"
+  echo ""
+  echo -e "  Then reload your shell:"
+  echo -e "    ${CYAN}source ~/.zshrc${RESET}   (or open a new terminal)"
+
+  # Auto-append to the detected shell profile if the user agrees
+  SHELL_PROFILE=""
+  if [[ -n "${ZSH_VERSION:-}" || "$SHELL" == */zsh ]]; then
+    SHELL_PROFILE="$HOME/.zshrc"
+  elif [[ -n "${BASH_VERSION:-}" || "$SHELL" == */bash ]]; then
+    SHELL_PROFILE="$HOME/.bashrc"
   fi
-  success "pipx installed"
-else
-  success "pipx $(pipx --version)"
-fi
 
-# ── 3. Install devex via pipx (editable) ─────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-info "Installing devex globally via pipx ..."
-# --editable means changes to the source are picked up without reinstalling
-if pipx list --short 2>/dev/null | grep -q "^claude-cli "; then
-  info "Already installed — reinstalling to pick up latest changes..."
-  pipx reinstall claude-cli --editable 2>/dev/null || pipx install --editable "$SCRIPT_DIR" --force
+  if [[ -n "$SHELL_PROFILE" ]]; then
+    echo ""
+    read -r -p "  Add it to $SHELL_PROFILE automatically? [Y/n] " ans
+    ans="${ans:-y}"
+    if [[ "${ans,,}" == "y" ]]; then
+      echo "" >> "$SHELL_PROFILE"
+      echo "# devex CLI" >> "$SHELL_PROFILE"
+      echo "export PATH=\"${USER_BIN}:\$PATH\"" >> "$SHELL_PROFILE"
+      success "Added to $SHELL_PROFILE"
+      warn "Run: source $SHELL_PROFILE   (or open a new terminal)"
+    fi
+  fi
 else
-  pipx install --editable "$SCRIPT_DIR"
+  DEVEX_PATH=$(command -v devex)
+  success "devex is on PATH  →  $DEVEX_PATH"
 fi
-success "devex installed  →  $(command -v devex)"
 
 # ── 4. .env setup ────────────────────────────────────────────────────────────
 cd "$SCRIPT_DIR"
@@ -89,10 +105,9 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}Setup complete!${RESET}"
 echo ""
-echo -e "  ${BOLD}devex${RESET} is now available globally — no activation needed."
-echo -e "  Run it from any project directory:"
+echo -e "  Run devex from any project directory:"
 echo -e "    ${CYAN}cd /your/project && devex scan${RESET}"
 echo ""
 echo -e "  To update devex after pulling new changes:"
-echo -e "    ${CYAN}pipx reinstall claude-cli${RESET}"
+echo -e "    ${CYAN}cd $(pwd) && pip install --user -e .${RESET}"
 echo ""
