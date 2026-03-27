@@ -4,6 +4,18 @@ markdown RIGHT NOW. Do not ask for confirmation. Do not ask questions. \
 Do not summarise what you are about to do. Just produce the full document \
 immediately.
 
+BEFORE reading any files, do this first:
+  1. Read every ignore file present in the repo root:
+       .gitignore, .dockerignore, .eslintignore, .prettierignore,
+       .npmignore, .scanignore, .devexignore  — read whichever exist.
+  2. Build the combined ignore list from all of them.
+  3. Never read, glob, or reference any file or directory that matches
+     a pattern in that list — treat them as if they do not exist.
+     Common examples: node_modules/, dist/, build/, .next/, __pycache__/,
+     *.log, .env, coverage/, .cache/, vendor/, *.min.js
+  This step is mandatory. Do it silently — do not list the ignored paths
+  in your output.
+
 Cover every section below without skipping or truncating:
 
 1. **Project overview** — what it does, tech stack, high-level architecture
@@ -36,7 +48,10 @@ HARD RULES:
 - Do not create, modify, or delete any file under any circumstance.
 - Do not ask for confirmation or permission.
 - Do not offer to do something — just output the document directly.
-- The knowledge base is your response text, not a file you save.\
+- The knowledge base is your response text, not a file you save.
+- Before reading anything, read all ignore files (.gitignore, .dockerignore,
+  etc.) and skip every path that matches — never read node_modules, dist,
+  build artefacts, secrets, or any other ignored path.\
 """
 
 KB_SYSTEM = """\

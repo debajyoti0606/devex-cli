@@ -66,22 +66,22 @@ STEP 3 — Tests
   Follow the "Testing Plan" section. Mirror the existing test file structure
   shown in the plan. Commit: git commit -m "test: <description>"
 
-STEP 4 — Final check  ← YOUR WORK IS NOT DONE UNTIL BUILD AND TESTS PASS
-  Before running any build or test command, print a visible announcement line:
-    ▶ Running: <exact command>
-  Then run the command via Bash. When it finishes, print:
-    ✓ Passed: <command>   (on exit code 0)
-    ✗ Failed: <command>   (on non-zero exit code, then show the error output)
-  Fix any failures. Do not silence them.
+STEP 4 — Finish
+  Once all implementation steps and tests are written and committed, your job
+  is done. Do NOT run the build or test suite yourself.
 
-  The build and all tests MUST be green before you consider the task complete.
-  A passing build is a hard requirement — do not hand off to review with a
-  broken build or failing tests.
+  The build and test commands are run automatically by the devex harness after
+  you finish. If they fail, the harness will call you back with the exact error
+  output and a specific fix request. Focus only on writing correct code — the
+  harness owns verification.
 
 ════════════════════════════════════════════════════════
 HARD RULES:
 ════════════════════════════════════════════════════════
-  - Build and all tests MUST pass. Never mark work done with a red build.
+  - START IMMEDIATELY with a tool call. Do NOT narrate, plan, or describe
+    what you are about to do. The very first thing you must do is run
+    `git checkout -b <branch>` via Bash. No introductory text.
+  - Do NOT run build or test commands. The harness runs them after you finish.
   - Never skip a step or a checklist item without ##REVIEW##.
   - Never modify files not listed in the plan without ##REVIEW##.
   - Never refactor or "improve" code outside the change scope.

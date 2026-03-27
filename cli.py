@@ -35,6 +35,7 @@ from prompts import (
     DEVELOPER_SYSTEM,
     REVIEWER_SYSTEM,
     DEVELOPER_FIX_SYSTEM,
+    BUILD_FIXER_SYSTEM,
 )
 
 from claude_agent_sdk import (
@@ -868,7 +869,91 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
     else:
         print(color(f"\n  Max rounds ({MAX_ROUNDS}) reached — proceeding with what we have.", YELLOW))
 
-    # ── Step 2.5: capture guardrails ──────────────────────────────────────────
+    # ── Step 2.5: consolidated summary + user confirmation ────────────────────
+    print(color("\n  [summarising understanding…]", DIM))
+
+    qa_block_for_summary = "\n".join(
+        f"Q: {item['question']}\nA: {item['answer']}" for item in qa_history
+    )
+    summary_prompt = (
+        f"Task: {task}\n\n"
+        + (f"Q&A so far:\n{qa_block_for_summary}\n\n" if qa_block_for_summary else "")
+        + "Write a SHORT consolidated summary (5–10 bullet points max) of what "
+        "you now understand the requirements to be. Be concrete and specific.\n\n"
+        "HARD RULES for this response:\n"
+        "- Output ONLY bullet points. No headers, no sections, no prose.\n"
+        "- Do NOT ask any questions or list 'clarifications needed'.\n"
+        "- Where something is still unclear, state your assumption explicitly "
+        "as a bullet: e.g. '• Assuming X because Y'.\n"
+        "- The user will confirm or correct your bullets in the next step.\n"
+        "- Do NOT write the full requirements doc — just the summary bullets."
+    )
+    summary, _ = await _silent_query(summary_prompt, TECH_LEAD_SYSTEM + kb_ctx, cwd)
+
+    print()
+    print(color("━" * 54, CYAN))
+    print(color("  Tech lead's understanding:", BOLD))
+    print(color("━" * 54, CYAN))
+    print()
+    for line in summary.strip().splitlines():
+        print(f"  {line}")
+    print()
+    print(color("━" * 54, CYAN))
+    print()
+
+    while True:
+        try:
+            confirm = await anyio.to_thread.run_sync(
+                lambda: input(color(
+                    "  Does this look right? [yes / no — add feedback]: ",
+                    BOLD
+                ))
+            )
+        except (EOFError, KeyboardInterrupt):
+            print(color("\nCancelled.", DIM))
+            return
+
+        confirm = confirm.strip()
+        if not confirm:
+            continue
+
+        if confirm.lower() in ("yes", "y", "ok", "okay", "looks good", "lgtm"):
+            print(color("  ✓ Confirmed — proceeding to requirements doc.", GREEN))
+            break
+
+        # User gave feedback — feed it back to the tech lead for one more round
+        print(color("\n  [updating understanding…]", DIM))
+        qa_history.append({"question": "Does this summary look correct?", "answer": confirm})
+
+        qa_block_for_summary = "\n".join(
+            f"Q: {item['question']}\nA: {item['answer']}" for item in qa_history
+        )
+        summary_prompt = (
+            f"Task: {task}\n\n"
+            f"Q&A so far:\n{qa_block_for_summary}\n\n"
+            "The user has given you feedback on your summary. Revise and rewrite "
+            "your understanding as SHORT bullet points (5–10 max). Be concrete.\n\n"
+            "HARD RULES for this response:\n"
+            "- Output ONLY bullet points. No headers, no sections, no prose.\n"
+            "- Do NOT ask any questions or list 'clarifications needed'.\n"
+            "- Where something is still unclear, state your assumption as a bullet: "
+            "'• Assuming X because Y'.\n"
+            "- The user will confirm or correct your bullets."
+        )
+        summary, _ = await _silent_query(summary_prompt, TECH_LEAD_SYSTEM + kb_ctx, cwd)
+
+        print()
+        print(color("━" * 54, CYAN))
+        print(color("  Revised understanding:", BOLD))
+        print(color("━" * 54, CYAN))
+        print()
+        for line in summary.strip().splitlines():
+            print(f"  {line}")
+        print()
+        print(color("━" * 54, CYAN))
+        print()
+
+    # ── Step 3: capture guardrails ────────────────────────────────────────────
     print()
     print(color("  Any guardrails / dos-and-don'ts for this task?", BOLD))
     print(color("  e.g. 'do not touch the auth module', 'always use async functions'", DIM))
@@ -901,7 +986,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
     else:
         print(color("  No guardrails added.", DIM))
 
-    # ── Step 3: generate requirements doc ─────────────────────────────────────
+    # ── Step 4: generate requirements doc ─────────────────────────────────────
     print(color("\n  [generating requirements document…]", DIM))
 
     qa_block = "\n".join(
@@ -921,7 +1006,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
         print(color("  Failed to generate document.", RED))
         return
 
-    # ── Step 4: save ──────────────────────────────────────────────────────────
+    # ── Step 5: save ──────────────────────────────────────────────────────────
     dest = (save_dir / "requirements.md") if save_dir else Path(cwd) / REQ_FILE
     dest.write_text(
         f"<!-- Generated: {datetime.now().isoformat()} -->\n\n"
@@ -1040,6 +1125,146 @@ Follow the MANDATORY PROCESS in your instructions:
     print(color(f"\n━━  Dev plan saved → {dest}", GREEN + BOLD))
 
 
+# ── Deterministic build checker ───────────────────────────────────────────────
+
+import subprocess as _subprocess
+
+class BuildResult:
+    def __init__(self, cmd: str, returncode: int, output: str):
+        self.cmd        = cmd
+        self.returncode = returncode
+        self.output     = output
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+def _run_one_cmd(cmd: str, cwd: str, timeout: int = 300) -> BuildResult:
+    """Run a single shell command, capture combined stdout+stderr."""
+    try:
+        proc = _subprocess.run(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (proc.stdout + proc.stderr).strip()
+        return BuildResult(cmd, proc.returncode, output)
+    except _subprocess.TimeoutExpired:
+        return BuildResult(cmd, 1, f"[timed out after {timeout}s]")
+    except Exception as exc:
+        return BuildResult(cmd, 1, str(exc))
+
+
+def run_build_check(
+    cwd: str,
+    cmds: list[str],
+    label: str = "build",
+    max_attempts: int = 3,
+) -> tuple[bool, list[BuildResult]]:
+    """
+    Run each command in `cmds` in sequence.  If any fails, retry the full
+    sequence up to `max_attempts` times (caller is responsible for triggering
+    a fix between attempts).
+
+    Returns (all_passed, list_of_results_from_last_attempt).
+    """
+    results: list[BuildResult] = []
+
+    for attempt in range(1, max_attempts + 1):
+        results = []
+        all_ok  = True
+
+        for cmd in cmds:
+            print(color(f"\n  ▶ Running [{label}]: {cmd}", CYAN + BOLD))
+            result = _run_one_cmd(cmd, cwd)
+            results.append(result)
+
+            if result.ok:
+                print(color(f"  ✓ Passed: {cmd}", GREEN))
+            else:
+                print(color(f"  ✗ Failed: {cmd}  (exit {result.returncode})", RED + BOLD))
+                if result.output:
+                    # Print first 60 lines of output so it's visible in the CLI
+                    lines = result.output.splitlines()
+                    for line in lines[:60]:
+                        print(color(f"    {line}", DIM))
+                    if len(lines) > 60:
+                        print(color(f"    … ({len(lines) - 60} more lines)", DIM))
+                all_ok = False
+                break   # stop sequence on first failure — no point running tests if build broke
+
+        if all_ok:
+            return True, results
+
+        if attempt < max_attempts:
+            print(color(
+                f"\n  ↺ {label} failed (attempt {attempt}/{max_attempts}) — "
+                "agent will fix and rebuild…", YELLOW
+            ))
+
+    return False, results
+
+
+def _build_failure_prompt(
+    results: list[BuildResult],
+    label: str,
+    devplan_doc: str = "",
+    attempt: int = 1,
+    max_attempts: int = 3,
+) -> str:
+    """
+    Build a rich fix prompt that includes:
+      - which stage failed and which attempt this is
+      - the exact command, exit code, and full output
+      - what was implemented (dev plan) so the agent knows which files were touched
+    """
+    parts: list[str] = []
+
+    parts.append(
+        f"BUILD GATE FAILURE — {label.upper()} (attempt {attempt}/{max_attempts})\n"
+        f"{'=' * 54}\n"
+        f"The {label} command failed after the implementation was complete.\n"
+        f"Read the error carefully, locate the root cause, and make the\n"
+        f"minimal change to fix it. Do not change anything unrelated.\n"
+    )
+
+    # Failing command(s) with full output
+    for r in results:
+        if not r.ok:
+            parts.append(f"Command   : {r.cmd}")
+            parts.append(f"Exit code : {r.returncode}")
+            parts.append("Output:\n```")
+            parts.append(r.output[:4000])
+            if len(r.output) > 4000:
+                parts.append(f"… ({len(r.output) - 4000} chars truncated)")
+            parts.append("```\n")
+
+    # What was just implemented — gives the agent file/function context
+    if devplan_doc:
+        # Include the full dev plan so the agent knows which files were touched
+        parts.append(
+            f"WHAT WAS IMPLEMENTED\n"
+            f"{'─' * 40}\n"
+            f"The following dev plan was just executed. Use it to understand\n"
+            f"which files were changed and what the intended behaviour is.\n\n"
+            f"<dev_plan>\n{devplan_doc}\n</dev_plan>\n"
+        )
+
+    parts.append(
+        f"{'─' * 54}\n"
+        f"Fix the failure, then commit:\n"
+        f"  git add <changed files>\n"
+        f"  git commit -m \"fix: <what was wrong>\"\n\n"
+        f"Do NOT re-run the {label} command. The harness will re-run it after you finish."
+    )
+
+    return "\n".join(parts)
+
+
 # ── Developer agent ───────────────────────────────────────────────────────────
 
 
@@ -1127,16 +1352,32 @@ async def cmd_dev(
         print(color(f"  Guardrails : loaded", DIM))
 
     # ── Build task prompt ─────────────────────────────────────────────────────
+    _build_cfg_for_prompt = load_build_config(cwd)
+    _build_cmds_for_prompt = _build_cfg_for_prompt.get("build", [])
+    _test_cmds_for_prompt  = _build_cfg_for_prompt.get("test",  [])
+    _build_note = ""
+    if _build_cmds_for_prompt or _test_cmds_for_prompt:
+        _build_note = (
+            "NOTE: After you finish, the devex harness will automatically run:\n"
+            + ("".join(f"  Build: {c}\n" for c in _build_cmds_for_prompt))
+            + ("".join(f"  Test:  {c}\n" for c in _test_cmds_for_prompt))
+            + "If any command fails you will be called back with the exact error to fix.\n"
+            "Do NOT run these commands yourself.\n\n"
+        )
+
     task_prompt = f"""\
 Branch to create: {branch}
 
+{_build_note}\
 {f'<requirements>{chr(10)}{req_doc}{chr(10)}</requirements>{chr(10)}{chr(10)}' if req_doc else ''}\
 <dev_plan>
 {devplan_doc}
 </dev_plan>
 
 {f'<guardrails>{chr(10)}{guardrails}{chr(10)}</guardrails>{chr(10)}{chr(10)}' if guardrails else ''}\
-Begin with STEP 0 (create the branch) and work through every step in order.
+Your first action MUST be a Bash tool call: `git checkout -b {branch}`
+Do NOT write any text before that tool call. Execute, do not narrate.
+Work through every step in order until all implementation steps and tests are committed.
 """
 
     opts = make_opts(
@@ -1164,6 +1405,71 @@ Begin with STEP 0 (create the branch) and work through every step in order.
     print(color("━" * 54, GREEN))
     print(color(f"  ✓ Implementation complete on branch: {branch}", GREEN + BOLD))
     print(color("━" * 54, GREEN))
+
+    # ── Deterministic build + test verification ───────────────────────────────
+    build_cfg  = load_build_config(cwd)
+    _build_cmds = build_cfg.get("build", [])
+    _test_cmds  = build_cfg.get("test",  [])
+    _no_build   = build_cfg.get("no_build", False)
+
+    if not _no_build:
+        MAX_FIX_ATTEMPTS = 3
+
+        for stage_label, stage_cmds in [("build", _build_cmds), ("test", _test_cmds)]:
+            if not stage_cmds:
+                continue
+
+            print()
+            print(color(f"  ── {stage_label} verification ──", BOLD))
+
+            passed = False
+            for fix_attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+                ok, results = run_build_check(cwd, stage_cmds, label=stage_label, max_attempts=1)
+                if ok:
+                    passed = True
+                    break
+
+                if fix_attempt == MAX_FIX_ATTEMPTS:
+                    print(color(
+                        f"\n  ✗ {stage_label} still failing after {MAX_FIX_ATTEMPTS} fix attempts.",
+                        RED + BOLD
+                    ))
+                    break
+
+                # Ask the agent to fix the failure
+                print(color(f"\n  [fix attempt {fix_attempt}/{MAX_FIX_ATTEMPTS}…]", YELLOW))
+                fix_prompt = _build_failure_prompt(
+                    results,
+                    stage_label,
+                    devplan_doc=devplan_doc,
+                    attempt=fix_attempt,
+                    max_attempts=MAX_FIX_ATTEMPTS,
+                )
+                fix_opts = make_opts(
+                    cwd=cwd,
+                    tools=["Read", "Glob", "Grep", "Write", "Edit", "Bash"],
+                    permission_mode="bypassPermissions" if auto else "acceptEdits",
+                    max_turns=40,
+                    system_prompt=BUILD_FIXER_SYSTEM + kb_ctx + gr_ctx,
+                )
+                try:
+                    async for message in query(
+                        prompt=fix_prompt, options=ClaudeAgentOptions(**fix_opts)
+                    ):
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, TextBlock):
+                                    print(block.text, end="", flush=True)
+                except KeyboardInterrupt:
+                    print(color("\n[interrupted]", YELLOW))
+                    break
+                print()
+
+            if not passed:
+                print(color(
+                    f"  ⚠ Proceeding to review with a failing {stage_label}. "
+                    "Reviewer will flag this.", YELLOW
+                ))
 
     if not no_review:
         await review_loop(
