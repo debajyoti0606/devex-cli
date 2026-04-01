@@ -780,14 +780,27 @@ async def _silent_query(
     )
     response_text = ""
     session_id: str | None = None
-    async for message in query(prompt=prompt, options=ClaudeAgentOptions(**opts)):
-        if isinstance(message, SystemMessage) and message.subtype == "init":
-            session_id = message.data.get("session_id")
-        elif isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    response_text += block.text
-        # let loop finish naturally — no early return
+    try:
+        async for message in query(prompt=prompt, options=ClaudeAgentOptions(**opts)):
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                session_id = message.data.get("session_id")
+            elif isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        response_text += block.text
+            # let loop finish naturally — no early return
+    except Exception as exc:
+        msg = str(exc)
+        print()
+        print(color("  ✗ Claude agent failed:", RED + BOLD))
+        print(color(f"    {msg}", RED))
+        if "exit code" in msg.lower() or "stderr" in msg.lower():
+            print()
+            print(color("  Possible causes:", BOLD))
+            print(color("  • ANTHROPIC_API_KEY is invalid or expired", DIM))
+            print(color("  • `claude` binary crashed — run `claude --version` to check", DIM))
+            print(color("  • Model quota exceeded", DIM))
+        raise
     return response_text.strip(), session_id
 
 
@@ -2327,7 +2340,24 @@ SUBCOMMANDS = {
 }
 
 def _check_env() -> None:
-    """Verify required environment variables are set. Exit with a clear message if not."""
+    """Verify required environment variables and dependencies are present."""
+    import shutil
+
+    # Check claude CLI is on PATH
+    if not shutil.which("claude"):
+        print()
+        print(color("  devex: `claude` CLI not found on PATH", RED + BOLD))
+        print()
+        print(color("  The claude-agent-sdk shells out to the `claude` binary.", DIM))
+        print(color("  Install Claude Code CLI:", DIM))
+        print()
+        print(color("    npm install -g @anthropic-ai/claude-code", CYAN))
+        print()
+        print(color("  If already installed, make sure it is on your PATH:", DIM))
+        print(color("    which claude", CYAN))
+        print()
+        sys.exit(1)
+
     required = {
         "ANTHROPIC_API_KEY": "Your Anthropic (or proxy) API key",
     }
