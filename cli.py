@@ -17,6 +17,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import readline  # noqa: F401 — enables arrow keys / history in input() on macOS/Linux
+except ImportError:
+    pass  # Windows — no readline, arrow keys won't work but nothing breaks
+
 import anyio
 
 try:
@@ -65,12 +70,22 @@ def color(text: str, *codes: str) -> str:
         return text
     return "".join(codes) + text + RESET
 
+def prompt_color(text: str, *codes: str) -> str:
+    """Like color(), but wraps escape sequences in \\x01/\\x02 so readline
+    measures the visible width correctly and doesn't overwrite the same line."""
+    if not sys.stdout.isatty():
+        return text
+    esc = "\x01" + "".join(codes) + "\x02"
+    reset = "\x01" + RESET + "\x02"
+    return esc + text + reset
+
 # ── Knowledge-base constants ──────────────────────────────────────────────────
 
 KB_FILE         = ".devex-kb.md"
 STATS_FILE      = ".devex-stats.json"
 GUARDRAILS_FILE = ".devex-guardrails.md"
 TASKS_DIR       = ".devex-tasks"
+STATUS_BOARD    = ".devex-status.md"
 BUILD_FILE      = ".devex-build.json"
 
 # Context window limit — override with CONTEXT_WINDOW env var
@@ -250,11 +265,69 @@ def _load_task(cwd: str, task_id: str) -> dict:
     p = _task_status_path(cwd, task_id)
     return json.loads(p.read_text()) if p.exists() else {}
 
+_STATUS_ICON = {
+    "pending":  "⏳",
+    "running":  "🔄",
+    "complete": "✅",
+    "failed":   "❌",
+}
+
 def _save_task(cwd: str, task_id: str, data: dict) -> None:
     data = {**data, "updated_at": datetime.now().isoformat()}
     _task_status_path(cwd, task_id).write_text(json.dumps(data, indent=2))
+    _write_status_board(cwd)
 
-def _list_tasks(cwd: str) -> list[dict]:
+def _write_status_board(cwd: str) -> None:
+    """Regenerate .devex-status.md from all task status.json files."""
+    tasks = _list_tasks_raw(cwd)
+    board_path = Path(cwd) / STATUS_BOARD
+
+    lines = [
+        "# devex task board",
+        "",
+        f"_Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_",
+        "",
+    ]
+
+    if not tasks:
+        lines.append("_No tasks yet. Run `devex task` to add one._")
+    else:
+        # Column widths
+        id_w     = 4
+        title_w  = max(30, max(len(t.get("title", "")[:50]) for t in tasks))
+        status_w = 10
+        branch_w = max(25, max(len(t.get("branch") or "—") for t in tasks))
+
+        def row(id_, title, status, branch, updated):
+            return (
+                f"| {id_:<{id_w}} "
+                f"| {title:<{title_w}} "
+                f"| {status:<{status_w}} "
+                f"| {branch:<{branch_w}} "
+                f"| {updated} |"
+            )
+
+        sep = (
+            f"| {'-'*id_w} "
+            f"| {'-'*title_w} "
+            f"| {'-'*status_w} "
+            f"| {'-'*branch_w} "
+            f"| {'-'*19} |"
+        )
+
+        lines.append(row("ID", "Title", "Status", "Branch", "Updated"))
+        lines.append(sep)
+        for t in tasks:
+            icon   = _STATUS_ICON.get(t.get("status", ""), "❓")
+            status = f"{icon} {t.get('status', '?')}"
+            branch = t.get("branch") or "—"
+            title  = (t.get("title") or "Untitled")[:title_w]
+            updated = (t.get("updated_at") or "")[:19].replace("T", " ")
+            lines.append(row(t.get("id", "?"), title, status, branch, updated))
+
+    board_path.write_text("\n".join(lines) + "\n")
+
+def _list_tasks_raw(cwd: str) -> list[dict]:
     root = _tasks_root(cwd)
     if not root.exists():
         return []
@@ -268,6 +341,9 @@ def _list_tasks(cwd: str) -> list[dict]:
                 except Exception:
                     pass
     return tasks
+
+def _list_tasks(cwd: str) -> list[dict]:
+    return _list_tasks_raw(cwd)
 
 def _extract_doc_title(doc_text: str) -> str:
     """Extract first H1 title from a markdown doc."""
@@ -543,7 +619,7 @@ async def _collect_cmds(label: str, detected: list[str]) -> list[str] | None:
 
         try:
             answer = await anyio.to_thread.run_sync(
-                lambda: input(color(f"  Select {label} commands {hint}: ", BOLD))
+                lambda: input(prompt_color(f"  Select {label} commands {hint}: ", BOLD))
             )
         except (EOFError, KeyboardInterrupt):
             return None
@@ -586,7 +662,7 @@ async def _collect_cmds(label: str, detected: list[str]) -> list[str] | None:
     while True:
         try:
             line = await anyio.to_thread.run_sync(
-                lambda: input(color(f"  {label}> ", YELLOW))
+                lambda: input(prompt_color(f"  {label}> ", YELLOW))
             )
         except (EOFError, KeyboardInterrupt):
             break
@@ -822,7 +898,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
     print(color("Describe the task you want to work on:", BOLD))
     print(color("(be as vague or detailed as you like — the tech lead will ask follow-ups)", DIM))
     try:
-        task = await anyio.to_thread.run_sync(lambda: input(color("\n> ", BOLD + GREEN)))
+        task = await anyio.to_thread.run_sync(lambda: input(prompt_color("\n> ", BOLD + GREEN)))
     except (EOFError, KeyboardInterrupt):
         print(color("\nCancelled.", DIM))
         return
@@ -859,7 +935,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
             print(color(f"  {i}. {q}", CYAN))
             try:
                 answer = await anyio.to_thread.run_sync(
-                    lambda: input(color("     → ", GREEN))
+                    lambda: input(prompt_color("     → ", GREEN))
                 )
             except (EOFError, KeyboardInterrupt):
                 print(color("\nCancelled.", DIM))
@@ -904,7 +980,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
     while True:
         try:
             confirm = await anyio.to_thread.run_sync(
-                lambda: input(color(
+                lambda: input(prompt_color(
                     "  Does this look right? [yes / no — add feedback]: ",
                     BOLD
                 ))
@@ -965,7 +1041,7 @@ async def cmd_requirements(cwd: str, kb_content: str | None, save_dir: Path | No
     while True:
         try:
             line = await anyio.to_thread.run_sync(
-                lambda: input(color("  guardrail> ", YELLOW))
+                lambda: input(prompt_color("  guardrail> ", YELLOW))
             )
         except (EOFError, KeyboardInterrupt):
             break
@@ -1268,21 +1344,21 @@ def _build_failure_prompt(
 # ── Developer agent ───────────────────────────────────────────────────────────
 
 
-def _branch_name_from_doc(doc_text: str) -> str:
-    """Extract task title from requirements or dev plan doc and convert to kebab-case."""
+def _branch_name_from_doc(doc_text: str, task_id: str | None = None) -> str:
+    """Extract task title from requirements or dev plan doc and convert to kebab-case.
+    Prefix with task_id when available to guarantee uniqueness."""
+    import re
+    prefix = f"devex/{task_id}-" if task_id else "devex/"
     for line in doc_text.splitlines():
         line = line.strip()
         if line.startswith("# "):
             title = line.lstrip("# ").strip()
-            # remove "Dev Plan:" / "Requirements:" prefix if present
-            for prefix in ("Dev Plan:", "Requirements:", "dev plan:", "requirements:"):
-                if title.lower().startswith(prefix.lower()):
-                    title = title[len(prefix):].strip()
-            # kebab-case
-            import re
+            for p in ("Dev Plan:", "Requirements:", "dev plan:", "requirements:"):
+                if title.lower().startswith(p.lower()):
+                    title = title[len(p):].strip()
             slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-            return f"devex/{slug}"[:60]
-    return "devex/feature"
+            return (prefix + slug)[:60]
+    return f"{prefix}feature"
 
 
 async def cmd_dev(
@@ -1296,6 +1372,7 @@ async def cmd_dev(
     req_file: Path | None = None,
     reviews_dir: Path | None = None,
     guardrails_override: str | None = None,
+    task_id: str | None = None,
 ) -> str | None:
     """Developer agent: reads dev plan → creates branch → implements code. Returns branch name."""
 
@@ -1313,7 +1390,7 @@ async def cmd_dev(
 
     # ── Resolve branch name ───────────────────────────────────────────────────
     if not branch:
-        branch = _branch_name_from_doc(req_doc or devplan_doc)
+        branch = _branch_name_from_doc(req_doc or devplan_doc, task_id=task_id)
 
     # ── Header ────────────────────────────────────────────────────────────────
     print(color("━" * 54, CYAN))
@@ -1331,7 +1408,7 @@ async def cmd_dev(
         print(color("  Pass --auto to skip all prompts.", DIM))
         try:
             confirm = await anyio.to_thread.run_sync(
-                lambda: input(color("  Proceed? [y/N] ", BOLD))
+                lambda: input(prompt_color("  Proceed? [y/N] ", BOLD))
             )
         except (EOFError, KeyboardInterrupt):
             print(color("\nCancelled.", DIM))
@@ -1878,36 +1955,42 @@ async def cmd_task(cwd: str, kb_content: str | None) -> None:
 def cmd_task_list(cwd: str) -> None:
     """List all queued tasks with their status."""
     tasks = _list_tasks(cwd)
+    _write_status_board(cwd)  # always refresh the file
+
     if not tasks:
         print(color("No tasks found. Run `devex task` to add one.", DIM))
+        print(color(f"  Status board: {Path(cwd) / STATUS_BOARD}", DIM))
         return
 
     STATUS_COLORS = {
         "pending":  YELLOW,
         "planning": CYAN,
         "running":  CYAN,
+        "complete": GREEN,
         "done":     GREEN,
         "failed":   RED,
     }
 
     print(color("━" * 60, CYAN))
-    print(color("  devex — Task Queue", BOLD + CYAN))
+    print(color("  devex — Task Board", BOLD + CYAN))
     print(color("━" * 60, CYAN))
-    print(color(f"  {'ID':<6}  {'Status':<10}  {'Branch':<28}  Title", BOLD))
-    print(color("  " + "─" * 56, DIM))
+    print(color(f"  {'ID':<6}  {'Status':<10}  {'Branch':<30}  Title", BOLD))
+    print(color("  " + "─" * 58, DIM))
     for t in tasks:
         tid    = t.get("id", "?")
         status = t.get("status", "?")
         branch = t.get("branch") or "—"
         title  = t.get("title", "Untitled")[:38]
+        icon   = _STATUS_ICON.get(status, "❓")
         sc     = STATUS_COLORS.get(status, DIM)
         print(
             f"  {color(tid, BOLD):<6}  "
-            f"{color(status, sc):<10}  "
-            f"{color(branch[:28], DIM):<28}  "
+            f"{icon} {color(status, sc):<18}  "
+            f"{color(branch[:30], DIM):<30}  "
             f"{title}"
         )
     print(color("━" * 60, CYAN))
+    print(color(f"  Status board: {Path(cwd) / STATUS_BOARD}", DIM))
 
 
 def _git_current_branch(cwd: str) -> str:
@@ -2007,6 +2090,7 @@ async def cmd_execute(cwd: str, kb_content: str | None) -> None:
                 req_file=req_file,
                 reviews_dir=reviews_dir,
                 guardrails_override=guardrails_override,
+                task_id=task_id,
             )
         except Exception as exc:
             print(color(f"  ✗ Implementation failed: {exc}", RED))
@@ -2094,7 +2178,7 @@ async def cmd_interactive(base_opts: dict, kb_content: str | None, cwd: str) -> 
     while True:
         try:
             prompt = await anyio.to_thread.run_sync(
-                lambda: input(color("\n> ", BOLD + GREEN))
+                lambda: input(prompt_color("\n> ", BOLD + GREEN))
             )
             prompt = prompt.strip()
         except (EOFError, KeyboardInterrupt):
